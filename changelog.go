@@ -1,41 +1,10 @@
-/*
-
-libgit2@1.3.0 needs to be installed. Use macports since brew doesn't seem to
-have it in official repos at the time of writing this.
-
-Examples:
-
-Commits can be denoted as hashes or refs. Make sure to pull and rebase changes
-from origin before running command to avoid any confusion.
-
-Common case for us (since latest deployment is always from head of master at the time of writing):
-
-$ changelog -start refs/heads/master -end refs/heads/develop -out
-changelog.md
-
-Other common cases:
-
-Using commit hashes only $ changelog -start
-f5a78eba828b905cfb559a427e1afcceb5d337ca -end
-9fda7b8c7c77b03f630973d4373d946adfaa76f7 -out /tmp/out.md
-
-Commit hash and reference
-
-$ changelog -start f5a78eba828b905cfb559a427e1afcceb5d337ca -end
-refs/heads/develop -out changelog.md $ changelog -start refs/heads/master -end
-HEAD -out changelog.md
-
-Only remote references (without rebasing on local). Don't use this. $ changelog
--start refs/remotes/origin/master -end refs/remotes/origin/develop -out
-changelog.md
-*/
-
 package main
 
 import (
 	"bufio"
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -48,16 +17,18 @@ import (
 	git "github.com/libgit2/git2go/v33"
 )
 
-// Project specific config. Edit as needed.
-const tmplGitlabDiffURL = `https://source.golabs.io/fleet_monetization/campaign-manager-service/-/compare/{{.StartCommitID}}...{{.EndCommitID}}`
-const tmplCommitURL = "https://source.golabs.io/fleet_monetization/campaign-manager-service/-/commit/{{.CommitID}}"
-
-const commitHashTruncate = 8 // print this many digits in the commit column of the changelog table
+var config struct {
+	ProjectName       string `json:"project_name"`
+	ProjectRepoURL    string `json:"project_repo_url"`
+	DiffURLTemplate   string `json:"diff_url_template"`
+	CommitURLTemplate string `json:"commit_url_template"`
+	CommitHashDigits  int    `json:"commit_hash_digits"`
+}
 
 // Don't need to edit below this line
 
 const tmplPreamble = `
-[Campaign Manager Service](https://source.golabs.io/fleet_monetization/campaign-manager-service) Deployment<br>
+[{{.ProjectName}}]({{.ProjectRepoURL}}) Deployment<br>
 {{.DateStringIST}} IST, {{.DateStringWIB}} WIB <br>
 [Diff: {{.StartCommitID}}...{{.EndCommitID}}]({{.GitlabDiffURL}}) <br>
 Authors: {{.AuthorListString}}
@@ -68,39 +39,38 @@ const commitInfoTableHeader = `
 `
 const tmplCommitInfoLine = `|[{{.CommitID}}]({{.CommitURL}})|{{.CommitAuthor}}|{{.CommitMessage}}|`
 
-type cliOptions struct {
+var opts struct {
 	startCommitID string
 	endCommitID   string
 	localRepoPath string
 	outputFile    string
+	configFile    string
 }
 
-var opts cliOptions
-
-func getCommit(repo *git.Repository, refString string, desc string) *git.Commit {
+func getCommit(repo *git.Repository, refOrHash string, desc string) *git.Commit {
 	// Try to parse as hex bytes
-	bytes, err := hex.DecodeString(refString)
+	bytes, err := hex.DecodeString(refOrHash)
 	if err == nil {
 		commitID := git.NewOidFromBytes(bytes)
 		if commitID == nil {
-			log.Fatalf("getCommit: failed to create oid from %s=%s", desc, refString)
+			log.Panicf("getCommit: failed to create oid from %s=%s", desc, refOrHash)
 		}
 		commit, err := repo.LookupCommit(commitID)
 		if err != nil {
-			log.Fatalf("getCommit: failed to get commit from %s=%s", desc, refString)
+			log.Panicf("getCommit: failed to get commit from %s=%s", desc, refOrHash)
 		}
 
 		// log.Printf("getCommit: %s: commit message: %s", desc, commit.Message())
-		log.Printf("getCommit: %s=%s: commit id: %s", desc, refString, commit.Id().String())
+		log.Printf("getCommit: %s=%s: commit id: %s", desc, refOrHash, commit.Id().String())
 
 		return commit
 	}
 
-	// log.Printf("%s=%s is not parseable as hex, treating as reference", desc, refString)
+	// log.Printf("%s=%s is not a hash string, treating as reference string", desc, refString)
 
-	ref, err := repo.References.Lookup(refString)
+	ref, err := repo.References.Lookup(refOrHash)
 	if err != nil {
-		log.Fatalf("getCommit: failed to lookup reference %s=%s", desc, refString)
+		log.Panicf("getCommit: failed to lookup reference %s=%s", desc, refOrHash)
 	}
 
 	switch ref.Type() {
@@ -108,34 +78,34 @@ func getCommit(repo *git.Repository, refString string, desc string) *git.Commit 
 		targetOid := ref.Target()
 		commit, err := repo.LookupCommit(targetOid)
 		if err != nil {
-			log.Fatalf("getCommit: %s=%s: %v", desc, refString, err)
+			log.Panicf("getCommit: %s=%s: %v", desc, refOrHash, err)
 		}
 
 		// log.Printf("getCommit: %s: commit message: %s", desc, commit.Message())
-		log.Printf("getCommit: %s=%s: commit id: %s", desc, refString, commit.Id().String())
+		log.Printf("getCommit: %s=%s: commit id: %s", desc, refOrHash, commit.Id().String())
 		return commit
 	case git.ReferenceSymbolic:
 		targetRefString := ref.SymbolicTarget()
-		log.Printf("%s=%s points to %s", desc, refString, targetRefString)
+		log.Printf("%s=%s points to %s", desc, refOrHash, targetRefString)
 
 		targetRef, err := repo.References.Lookup(targetRefString)
 		if err != nil {
-			log.Fatalf("getCommit: failed to lookup ref %s for %s=%s", targetRefString, desc, refString)
+			log.Panicf("getCommit: failed to lookup ref %s for %s=%s", targetRefString, desc, refOrHash)
 		}
 		object, err := targetRef.Peel(git.ObjectCommit)
 		if err != nil {
-			log.Fatalf("getCommit: failed to get object %s for %s=%s: %v", targetRefString, desc, refString, err)
+			log.Panicf("getCommit: failed to get object %s for %s=%s: %v", targetRefString, desc, refOrHash, err)
 		}
 		commit, err := object.AsCommit()
 		if err != nil {
-			log.Fatalf("getCommit: failed to get commit object %s for %s=%s: %v", targetRefString, desc, refString, err)
+			log.Panicf("getCommit: failed to get commit object %s for %s=%s: %v", targetRefString, desc, refOrHash, err)
 		}
 		// log.Printf("getCommit: %s=%s: commit message: %s", desc, refString, commit.Message())
-		log.Printf("getCommit: %s=%s: commit id: %s", desc, refString, commit.Id().String())
+		log.Printf("getCommit: %s=%s: commit id: %s", desc, refOrHash, commit.Id().String())
 		return commit
 
 	default:
-		log.Fatal("getCommit: should be unreachable code here")
+		log.Panic("getCommit: should be unreachable code")
 	}
 	return nil
 }
@@ -144,11 +114,11 @@ func getCommitChain(repo *git.Repository, end, start *git.Commit) []*git.Oid {
 	// Check first that end is reachable from start
 	reachable, err := repo.DescendantOf(end.Id(), start.Id())
 	if err != nil {
-		log.Fatalf("failed to check if end commit is descendent of start commit: %v", err)
+		log.Panicf("failed to check if end commit is descendent of start commit: %v", err)
 	}
 
 	if !reachable {
-		log.Fatalf("ERROR: end-commit %s not reachable from start commit %s", end.Id().String(), start.Id().String())
+		log.Panicf("ERROR: end-commit %s not reachable from start commit %s", end.Id().String(), start.Id().String())
 	}
 
 	// From end to start
@@ -156,14 +126,14 @@ func getCommitChain(repo *git.Repository, end, start *git.Commit) []*git.Oid {
 
 	revWalker, err := repo.Walk()
 	if err != nil {
-		log.Fatal(err)
+		log.Panic(err)
 	}
 
 	revWalker.Sorting(git.SortTopological)
 
 	err = revWalker.Push(end.Id())
 	if err != nil {
-		log.Fatal(err)
+		log.Panic(err)
 	}
 
 	curCommitID := new(git.Oid)
@@ -176,7 +146,7 @@ func getCommitChain(repo *git.Repository, end, start *git.Commit) []*git.Oid {
 		curCommitID = new(git.Oid) // Need to allocate new object, or Next() would overwrite the current one
 	}
 	if err != nil {
-		log.Fatalf("rev-walk stopped due to error: %v", err)
+		log.Panicf("rev-walk stopped due to error: %v", err)
 	}
 	return commits
 }
@@ -197,27 +167,31 @@ type CommitInfo struct {
 func writePreamble(w io.Writer, repo *git.Repository, startCommitID, endCommitID *git.Oid, commitChain []*git.Oid) {
 	preambleTemplate, err := template.New("preamble").Parse(tmplPreamble)
 	if err != nil {
-		log.Fatal(err)
+		log.Panic(err)
 	}
 
-	now := time.Now()
 	var preambleInfo struct {
+		ProjectName      string
+		ProjectRepoURL   string
 		DateStringIST    string
 		DateStringWIB    string
 		AuthorListString string
 		DiffURLInfo
 	}
 
+	preambleInfo.ProjectName = config.ProjectName
+	preambleInfo.ProjectRepoURL = config.ProjectRepoURL
 	preambleInfo.DiffURLInfo = makeDiffURL(w, startCommitID, endCommitID)
 
+	now := time.Now()
 	ist, err := time.LoadLocation("Asia/Kolkata")
 	if err != nil {
-		log.Fatal(err)
+		log.Panic(err)
 	}
 
 	wib, err := time.LoadLocation("Asia/Jakarta")
 	if err != nil {
-		log.Fatal(err)
+		log.Panic(err)
 	}
 
 	nowIST := now.In(ist)
@@ -229,7 +203,7 @@ func writePreamble(w io.Writer, repo *git.Repository, startCommitID, endCommitID
 
 	err = preambleTemplate.Execute(w, &preambleInfo)
 	if err != nil {
-		log.Fatal(err)
+		log.Panic(err)
 	}
 	io.WriteString(w, "<br>")
 }
@@ -246,16 +220,16 @@ func makeDiffURL(w io.Writer, endCommitID, startCommitID *git.Oid) DiffURLInfo {
 	diffURLInfo.StartCommitID = startCommitID.String()
 	diffURLInfo.EndCommitID = endCommitID.String()
 
-	diffURLTemplate, err := template.New("diff_url").Parse(tmplGitlabDiffURL)
+	diffURLTemplate, err := template.New("diff_url").Parse(config.DiffURLTemplate)
 	if err != nil {
-		log.Fatal(err)
+		log.Panic(err)
 	}
 
 	url := bytes.NewBufferString("")
 
 	err = diffURLTemplate.Execute(url, &diffURLInfo)
 	if err != nil {
-		log.Fatal(err)
+		log.Panic(err)
 	}
 
 	diffURLInfo.GitlabDiffURL = url.String()
@@ -271,7 +245,7 @@ func getAuthorListString(repo *git.Repository, commitChain []*git.Oid) string {
 	for _, commitID := range commitChain {
 		commit, err := repo.LookupCommit(commitID)
 		if err != nil {
-			log.Fatal(err)
+			log.Panic(err)
 		}
 
 		authors[commit.Author().Name] = struct{}{}
@@ -287,14 +261,14 @@ func getAuthorListString(repo *git.Repository, commitChain []*git.Oid) string {
 }
 
 func writeCommitChain(repo *git.Repository, commitChain []*git.Oid, w io.Writer) {
-	commitURLTemplate, err := template.New("commit_url").Parse(tmplCommitURL)
+	commitURLTemplate, err := template.New("commit_url").Parse(config.CommitURLTemplate)
 	if err != nil {
-		log.Fatal(err)
+		log.Panic(err)
 	}
 
 	commitInfoTemplate, err := template.New("commit_info").Parse(tmplCommitInfoLine)
 	if err != nil {
-		log.Fatal(err)
+		log.Panic(err)
 	}
 
 	io.WriteString(w, commitInfoTableHeader)
@@ -302,11 +276,11 @@ func writeCommitChain(repo *git.Repository, commitChain []*git.Oid, w io.Writer)
 	for _, commitID := range commitChain {
 		commit, err := repo.LookupCommit(commitID)
 		if err != nil {
-			log.Fatal(err)
+			log.Panic(err)
 		}
 
 		commitInfo := CommitInfo{
-			CommitID:      string(truncateBytes([]byte(commit.Id().String()), commitHashTruncate)),
+			CommitID:      string(truncateBytes([]byte(commit.Id().String()), config.CommitHashDigits)),
 			CommitAuthor:  commit.Author().Name,
 			CommitMessage: firstLineOfMessage(commit.Message()),
 		}
@@ -321,26 +295,64 @@ func writeCommitChain(repo *git.Repository, commitChain []*git.Oid, w io.Writer)
 }
 
 func truncateBytes(b []byte, n int) []byte {
+	if n == -1 { // special
+		return b
+	}
+
 	if len(b) < n {
 		n = len(b)
 	}
 	return b[0 : n-1]
 }
 
+func parseJSONConfig(filepath string) {
+	f, err := os.Open(filepath)
+	if err != nil {
+		log.Panicf("failed to read config file: %v", err)
+	}
+
+	err = json.NewDecoder(f).Decode(&config)
+	if err != nil {
+		log.Panicf("failed to parse config file: %v", err)
+	}
+
+	if config.CommitHashDigits <= 0 {
+		config.CommitHashDigits = -1 // special
+	}
+
+	log.Printf(`config:
+ProjectName       :%s
+ProjectRepoURL    :%s
+DiffURLTemplate   :%s
+CommitURLTemplate :%s`, config.ProjectName, config.ProjectRepoURL, config.DiffURLTemplate, config.CommitURLTemplate)
+}
+
 func main() {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Printf("FAILED to generate changelog due to error: %v", err)
+		}
+	}()
+
 	flag.StringVar(&opts.startCommitID, "start", "", "start commit ID")
 	flag.StringVar(&opts.endCommitID, "end", "HEAD", "end commit ID")
 	flag.StringVar(&opts.localRepoPath, "repo", "", "path to local repo")
 	flag.StringVar(&opts.outputFile, "out", "", "path to output file")
+	flag.StringVar(&opts.configFile, "config", "", "path to config.json")
 	flag.Parse()
 
-	var err error
+	if opts.configFile == "" {
+		log.Panic("expected a config file as -config command-line argument")
+	}
 
+	parseJSONConfig(opts.configFile)
+
+	var err error
 	out := os.Stdout
 	if opts.outputFile != "" {
 		out, err = os.OpenFile(opts.outputFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 		if err != nil {
-			log.Fatal(err)
+			log.Panic(err)
 		}
 		defer out.Close()
 	}
@@ -366,4 +378,11 @@ func main() {
 
 	writePreamble(out, repo, endCommit.Id(), startCommit.Id(), commits)
 	writeCommitChain(repo, commits, out)
+
+	outputFile := opts.outputFile
+	if outputFile == "" {
+		outputFile = "<stdout>"
+	}
+
+	log.Printf("Output file: %s", outputFile)
 }
