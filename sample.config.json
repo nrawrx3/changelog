@@ -1,0 +1,8 @@
+{
+        "project_name": "Changelog",
+        "project_repo_url": "https://github.com/nrawrx3/changelog",
+
+        "diff_url_template": "https://github.com/nrawrx3/changelog/-/compare/{{.StartCommitID}}...{{.EndCommitID}}",
+        "commit_url_template": "https://github.com/nrawrx3/changelog/-/commit/{{.CommitID}}",
+        "commit_hash_digits": 8
+}
